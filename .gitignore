@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+*.spec
+build/
+dist/
+backups/
+firmware/
+exe_test*/
+run.log

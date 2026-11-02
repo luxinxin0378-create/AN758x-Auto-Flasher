@@ -1,0 +1,28 @@
+{
+ "tag": "v2026.07-4",
+ "files": {
+  "an7581-fiberhome-hg5382a-bl31-u-boot.fip": 340992,
+  "an7581-fiberhome-hg5382a-firstblock.bin": 131072,
+  "an7581-fiberhome-hg5382a-preloader.bin": 115712,
+  "an7581-fiberhome-hg5585f-ct-bl31-u-boot.fip": 340992,
+  "an7581-fiberhome-hg5585f-ct-firstblock.bin": 131072,
+  "an7581-fiberhome-hg5585f-ct-preloader.bin": 115712,
+  "an7581-fiberhome-hg5585f-cu-bl31-u-boot.fip": 340992,
+  "an7581-fiberhome-hg5585f-cu-firstblock.bin": 131072,
+  "an7581-fiberhome-hg5585f-cu-preloader.bin": 115712,
+  "an7581-gemtek-xg2010g-bl31-u-boot.fip": 331776,
+  "an7581-gemtek-xg2010g-preloader.bin": 113664,
+  "an7581-nokia-xg-040g-md-bl31-u-boot.fip": 370688,
+  "an7581-nokia-xg-040g-md-preloader.bin": 113664,
+  "an7581-nokia-xg-040g-tf-bl31-u-boot.fip": 338944,
+  "an7581-nokia-xg-040g-tf-preloader.bin": 113664,
+  "an7581-unionman-ung00a-bl31-u-boot.fip": 333824,
+  "an7581-unionman-ung00a-preloader.bin": 113664,
+  "an7581-znxt-zn504xg-d-bl31-u-boot.fip": 333824,
+  "an7581-znxt-zn504xg-d-preloader.bin": 113664,
+  "an7581-znxt-zn515xg-d-bl31-u-boot.fip": 333824,
+  "an7581-znxt-zn515xg-d-preloader.bin": 113664,
+  "an7583-nokia-xg-040g-mf-bl31-u-boot.fip": 381952,
+  "an7583-nokia-xg-040g-mf-preloader.bin": 119808
+ }
+}
