@@ -32,10 +32,9 @@ exe 特性：
   `v2026.07-4` 的全部 23 个资产（10 个机型的 BL2 + U-Boot FIP，含 INDEX.json 校验清单）。
   选好机型点「**使用内置引导包**」即可离线就位，无需联网；
   想追新可点「**联网更新**」强制从 Releases 拉最新版。
-- Gemtek XR1710G 与 H3C HM2004-DU 未内置：上游源码有 defconfig，但 Releases 未发布
-  预编译包（CI 只传到 Actions artifacts），页面打「引导包需自备」标签并给出获取方式。
-  XR1710G 另有社区 chainloader 路线（`naoki66/XR1710G-http-uboot`），
-  与本工具的 BL2+FIP 路径不同，**不可混用**。
+- XR1710G 走专属 chainloader 路线（chainloader 已内置 + 固件可在线下载，见上文专节）。
+- H3C HM2004-DU 未内置引导包：上游源码有 defconfig，但 Releases 未发布预编译包
+  （CI 只传到 Actions artifacts），页面打「引导包需自备」标签并给出获取方式。
 - **数据目录跟着 exe 走**：`backups/`、`files/`、`firmware/` 都在 exe 所在目录，
   不写注册表、不留临时文件，整个目录拷 U 盘即可随身携带。
 - 首次运行 Windows Defender / 部分杀软可能因「PyInstaller 单文件 + 无数字签名」
@@ -65,7 +64,40 @@ pyinstaller --onefile --name "AN758x自动刷机工具" --clean --noconfirm ^
 | H3C HM2004-DU | XGPON | factory | 直写 |
 | 九联 UNG00A、兆能 ZN504XG-D / ZN515XG-D | 10G PON | reservearea | 直写 |
 | 贝尔 XG-040G-MD / -TF / -MF | 10G PON | bosa + ri | 直写 |
-| Gemtek XG2010G / XR1710G | 10G PON | dsd | 直写 |
+| Gemtek XG2010G | 10G PON | dsd | 直写 |
+| **Gemtek XR1710G** | 双万兆 WiFi 路由 | DSD（恢复页自动保） | **chainloader 路线** |
+
+## XR1710G 专属：chainloader 刷机路线
+
+XR1710G（Brightspeed 双万兆）不走 stock2ubi 路线，走的是社区
+[naoki66/XR1710G-http-uboot](https://github.com/naoki66/XR1710G-http-uboot)
+（fork 自 YYH2913/http-uboot）的链式加载方案。选择该机型后页面自动切换为专属流程：
+
+**① 首次安装（原厂固件 → chainloader，需要拆机接 TTL）**
+
+1. 页面点「在线下载」取 chainloader（exe 已内置最新 `*-flash-slot.bin`，离线可用）；
+2. 点「生成 TTL 命令 + 启动 TFTP」——工具自动探测本机 IP、启动 TFTP 服务
+   （端口 69），给出逐行粘贴的命令清单（含旧环境修正版）；
+3. 电脑网卡设为同网段静态 IP，串口终端（115200）上电打断进原厂 U-Boot，
+   逐行粘贴命令：`tftpboot` → `flash erase 0x600000 0x100000` →
+   `flash write` → `reset`。当前双入口镜像**无需改 bootcmd**。
+
+**② 刷固件（全自动）**
+
+设备进恢复模式（10G 口 LED 闪烁时长按 reset，状态灯变跑马灯；电脑网卡保持
+DHCP，恢复页地址 `192.168.255.1`）。页面点「开始」后工具自动完成：
+
+- **自动判定 UBI 布局**：解析 sysupgrade.itb 内嵌设备树的 ubi 分区大小，
+  自动选 2.0 / 1.5 / 1.0——这是该路线最大的坑（选错会导致内核能起但 Linux
+  卡在等 `/dev/fit0`），工具替你排掉；解析不了才要求手选；
+- 上传固件（POST `/upload/firmware?layout=…`）、轮询 `/status` 进度到完成、
+  自动 reboot。出厂 EEPROM 与 MAC 由恢复页从厂商 DSD 区自动恢复，无需手动备份。
+
+固件同样可一键在线下载（naoki66/ImmortalWrt-for-Gemtek-XR1710G Releases，
+约 46 MB，直连失败自动走镜像）。
+
+> 注意：pbs05 路线的 BL2+FIP 与本路线的 chainloader 是两套引导体系，
+> **不可交叉使用**；本工具按机型自动隔离，选错路线的文件会被拦下。
 
 ## 使用前准备
 
@@ -111,12 +143,14 @@ pyinstaller --onefile --name "AN758x自动刷机工具" --clean --noconfirm ^
 
 ```
 flasher.py     主程序：Web 服务 + 流程引擎 + stock2ubi/U-Boot/telnet 客户端
+chainroute.py  XR1710G chainloader 路线：TFTP 服务 / FIT 布局解析 / 恢复页客户端
+test_chain_mock.py  XR1710G 路线离线端到端自测
 devices.py     机型档案（新增机型只需在此加一条）
 ui.py          前端单页
 fhfactory.py   烽火 factory 3M→1M 转换（fiberhome-factory 的 Python 移植，GPL-2.0）
 test_mock.py   离线端到端自测（模拟两端 API）：python test_mock.py
 dist/          打包产物 AN758x自动刷机工具.exe（免 Python 环境，内置 stock2ubi + AN758x 全系引导包）
-bundled_fw/    内置 AN758x 引导包（uboot-an758x v2026.07-4 全 23 个资产）+ INDEX.json
+bundled_fw/    内置引导包（uboot-an758x v2026.07-4 全 23 个资产 + XR1710G chainloader）
 files/         an758x-stock2ubi 存放处
 firmware/      在线/内置引导包的落地目录
 backups/       备份输出

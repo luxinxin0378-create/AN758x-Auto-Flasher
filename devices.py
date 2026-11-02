@@ -48,6 +48,9 @@ class Device:
     telnet_enable: str = "manual"    # fhtool / manual（用户自行开好）
     fhtool_port: int = 8080
     note: str = ""
+    # 刷机路线：stock2ubi（烽火系免拆工具路线）/ chainloader（XR1710G 链式加载路线，
+    # 走 naoki66/XR1710G-http-uboot 的 TTL+TFTP 首刷 + HTTP 恢复页）
+    route: str = "stock2ubi"
     # 上游 uboot-an758x 的 GitHub Releases 是否提供预编译 BL2/FIP。
     # 源码里 12 个 defconfig 全有，但 Releases 只发了 10 个机型；
     # xr1710g / hm2004-du 仅存在于 CI 构建的 Actions artifacts（需登录下载），
@@ -92,6 +95,7 @@ class Device:
             "stock_ip": self.stock_ip,
             "uboot_ip": self.uboot_ip,
             "telnet_enable": self.telnet_enable,
+            "route": self.route,
             "note": self.note,
             "bl2_patterns": list(self.bl2_patterns),
             "fip_patterns": list(self.fip_patterns),
@@ -291,10 +295,9 @@ DEVICES = [
             su_password="admin",
         ),
         telnet_enable="manual",
-        note="XG2010G 姊妹型号。上游有 defconfig 但 Releases 未发布预编译包，BL2/FIP 需自备。\n"
-             "替代路线：社区 naoki66/XR1710G-http-uboot 发布的是 chainloader.itb（走原厂 web "
-             "升级的链式加载），与本工具的 BL2+FIP 路径不同，两者不可混用。",
-        bootloader_release=False,
+        route="chainloader",
+        note="XG2010G 姊妹型号。本工具走 chainloader 路线（TTL+TFTP 首刷 → HTTP 恢复页），"
+             "引导与固件均可在线自动下载；上游 pbs05 路线无此机型预编译包。",
     ),
     Device(
         key="hm2004-du",

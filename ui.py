@@ -112,6 +112,37 @@ padding:1px 8px;font-size:11.5px;margin-right:6px}
   <div class="note" id="pwNote"></div>
 </div>
 
+<div class="card files" id="chaincard" style="display:none">
+  <h2>3 · XR1710G chainloader 路线</h2>
+  <div class="note" style="margin-bottom:8px">
+    路线：<b>TTL + TFTP 首刷 chainloader</b>（仅原厂固件的机器需要）→ 之后走
+    <b>HTTP 恢复页（192.168.255.1）</b>自动刷固件。已刷过 chainloader 的机器直接从
+    「执行」开始（进恢复模式即可）。
+  </div>
+  <div class="f"><b>chainloader</b><input type=text id=chainbl placeholder="xr1710g-*-flash-slot.bin">
+    <button class=ghost id=chaindl>在线下载</button><span id=chainbls></span></div>
+  <div class="f"><b>系统固件</b><input type=text id=chainfw placeholder="*-xr1710g-*-sysupgrade.itb">
+    <button class=ghost id=chainfwdl>在线下载</button><span id=chainfws></span></div>
+  <div class="row" style="margin-bottom:6px">
+    <label>UBI 布局</label>
+    <select id=chainlay><option value="">自动判定（推荐）</option>
+      <option value="2.0">2.0（439 MiB）</option><option value="1.5">1.5（471.75 MiB）</option>
+      <option value="1.0">1.0（507 MiB）</option></select>
+    <button class=ghost id=chainana>分析固件</button>
+    <span id=chainlays></span>
+  </div>
+  <div class="note" id=chainDl style="display:none"></div>
+  <hr>
+  <div class="row" style="margin-bottom:6px">
+    <b style="font-size:13px">首次安装（原厂固件 → chainloader）</b>
+  </div>
+  <div class="row" style="margin-bottom:6px">
+    <label>本机 IP</label><input type=text id=pcip placeholder="自动探测；不对就手填（如 192.168.1.10）">
+    <button class=ghost id=ttlbtn>生成 TTL 命令 + 启动 TFTP</button>
+  </div>
+  <div class="note" id=ttlOut style="display:none"></div>
+</div>
+
 <div class="card files" id="filecard">
   <h2>4 · 固件文件</h2>
   <div class="row" style="margin-bottom:10px">
@@ -205,6 +236,15 @@ function pick(){
   $("pwNote").textContent=DEV.telnet_enable==="fhtool"
    ?"该机型可自动读取 MAC 并推导密码（也可手工覆盖）。若 8080 的 fh_tool RPC 可用，可先自动开 telnet。"
    :"该机型请确保 telnet 已开启，账号密码按当地固件实际填写（默认值仅为常见参考）。";
+  // chainloader 路线：切换可见卡片
+  const isChain=DEV.route==="chainloader";
+  $("chaincard").style.display=isChain?"block":"none";
+  $("conncard").style.display=isChain?"none":"block";
+  $("filecard").style.display=isChain?"none":"block";
+  if(isChain){
+    $("chainfw").value=localStorage.getItem("pf_chainfw")||"";
+    $("chainbl").value=localStorage.getItem("pf_chainbl")||"";
+  }
 }
 $("dev").onchange=pick;
 
@@ -246,6 +286,76 @@ async function doFetch(online){
 }
 $("fetchfw").onclick=()=>doFetch(false);
 $("fetchfwOnline").onclick=()=>doFetch(true);
+
+// ---------- XR1710G chainloader 路线 ----------
+function chainPollDl(){
+  return new Promise(res=>{
+    const iv=setInterval(async()=>{
+      const st=await jget("/api/chain/dl");
+      if(st.error){clearInterval(iv);alert("下载失败：\n"+st.error);res(null);}
+      if(!st.busy&&st.result){clearInterval(iv);
+        $("chainDl").style.display="none";res(st.result);}
+    },2000);
+  });
+}
+async function chainDownload(what){
+  const r=await jpost("/api/chain/download",{what});
+  if(r.error)return alert(r.error);
+  const put=(res)=>{
+    if(what==="firmware"){
+      $("chainfw").value=res.path;localStorage.setItem("pf_chainfw",res.path);
+      $("chainfws").innerHTML='<span class=ok-tag>✔ tag '+esc(res.tag)+'</span>';
+    }else{
+      $("chainbl").value=res.path;localStorage.setItem("pf_chainbl",res.path);
+      $("chainbls").innerHTML='<span class=ok-tag>✔ '+(res.tag==="内置"?"内置":("tag "+esc(res.tag)))+'</span>';
+    }
+  };
+  if(r.result){put(r.result);return;}   // exe 内置 chainloader，同步返回
+  $("chainDl").style.display="block";
+  $("chainDl").textContent=(what==="firmware"?"固件":"chainloader")+" 下载中…（固件约 46 MB，耐心等）";
+  const res=await chainPollDl();
+  if(!res)return;
+  put(res);
+  if(what==="firmware"){
+    const a=await jpost("/api/chain/analyze",{file:res.path});
+    if(a&&!a.error&&a.layout){$("chainlays").innerHTML=
+      '<span class=ok-tag>布局 '+a.layout+'（自动）</span>';}
+  }
+}
+$("chaindl").onclick=()=>chainDownload("chainloader");
+$("chainfwdl").onclick=()=>chainDownload("firmware");
+$("chainfw").onchange=()=>localStorage.setItem("pf_chainfw",$("chainfw").value.trim());
+$("chainbl").onchange=()=>localStorage.setItem("pf_chainbl",$("chainbl").value.trim());
+$("chainana").onclick=async()=>{
+  const f=$("chainfw").value.trim(); if(!f)return alert("先填系统固件路径");
+  const r=await jpost("/api/chain/analyze",{file:f});
+  if(r.error)return alert(r.error);
+  $("chainlays").innerHTML=r.layout
+    ?'<span class=ok-tag>布局 '+r.layout+'（'+esc(r.desc||"")+'）</span>'
+    :'<span class=miss>'+esc(r.desc||"无法判定")+'</span>';
+};
+$("ttlbtn").onclick=async()=>{
+  const f=$("chainbl").value.trim();
+  if(!f)return alert("先填 chainloader 文件（可点「在线下载」）");
+  const pc=$("pcip").value.trim()||undefined;
+  const r=await jpost("/api/chain/ttl",{file:f,pc_ip:pc});
+  if(r.error)return alert(r.error);
+  $("pcip").value=r.pc_ip;
+  $("ttlOut").style.display="block";
+  $("ttlOut").innerHTML=
+   '<b>电脑已设好：TFTP 服务已启动（端口 69，文件 '+esc(r.tftp.file)+'，'
+   +Math.round(r.tftp.size/1024)+' KB）。本机 IP = <code>'+esc(r.pc_ip)+'</code>'
+   +'（网卡手动设成同网段，如 '+esc(r.pc_ip.replace(/\.\d+$/,".10"))+'）</b><br>'
+   +'拆机接 TTL（115200），上电打断进 U-Boot 命令行后，<b>逐行粘贴</b>：'
+   +'<pre style="margin:6px 0;white-space:pre-wrap;background:#11131a;color:#c9d1d9;'
+   +'padding:8px;border-radius:6px;font-size:12.5px">'+esc(r.script)+'</pre>'
+   +'若 <code>printenv bootcmd</code> 不是 <code>flash read 0x602100 0x4000000 $loadaddr; bootm</code>，'
+   +'改用这份（含环境修正）：'
+   +'<pre style="margin:6px 0;white-space:pre-wrap;background:#11131a;color:#c9d1d9;'
+   +'padding:8px;border-radius:6px;font-size:12.5px">'+esc(r.script_old_env)+'</pre>'
+   +'看到 TFTP 传完、flash write 无报错、reset 后 10G 口 LED 闪烁时长按 reset 即进恢复页。'
+   +'刷完固件后点「开始」走自动流程（或直接在恢复页手动上传）。';
+};
 $("probemac").onclick=async()=>{
   const r=await jpost("/api/probe_mac",{ip:$("ip").value.trim(),port:8080});
   if(r.mac){$("mac").value=r.mac;pick();}else alert(r.error||"读取失败");
@@ -265,6 +375,15 @@ $("toolfile").onchange=async e=>{
 };
 
 $("start").onclick=async()=>{
+  if(DEV.route==="chainloader"){
+    const cfg={mode:"full",device:DEV.key,ip:"192.168.255.1",
+      firmware:$("chainfw").value.trim(),layout:$("chainlay").value||null};
+    if(!cfg.firmware)return alert("请先填系统固件（可点「在线下载」）");
+    if(!confirm("即将通过恢复页刷入固件。已确认：\n· 已装 chainloader（否则先做上面的 TTL 首刷）\n· 电脑网卡为 DHCP\n· 设备供电稳定？"))return;
+    const r=await jpost("/api/start",cfg);
+    if(r.error)return alert(r.error);
+    showRun(); return;
+  }
   const cfg={mode:MODE,device:DEV.key,ip:$("ip").value.trim(),
     mac:$("mac").value.trim(),telnet_user:$("tuser").value.trim(),
     telnet_pass:$("tpass").value.trim(),su_pass:$("spass").value.trim()};
@@ -276,6 +395,10 @@ $("start").onclick=async()=>{
   $("panel").style.display="block";$("abort").style.display="inline-block";$("start").disabled=true;
   TIMER=setInterval(poll,1000);poll();
 };
+function showRun(){
+  $("panel").style.display="block";$("abort").style.display="inline-block";$("start").disabled=true;
+  TIMER=setInterval(poll,1000);poll();
+}
 $("abort").onclick=async()=>{ if(confirm("确认中止？正在写入的操作无法安全中断。")){
   await jpost("/api/abort");}};
 $("mok").onclick=()=>answer(true); $("mdeny").onclick=()=>answer(false);

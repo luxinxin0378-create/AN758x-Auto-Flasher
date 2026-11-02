@@ -55,6 +55,7 @@ BACKUP_ROOT.mkdir(exist_ok=True)
 
 from devices import DEVICES, BY_KEY, get as get_device, mac_suffix, normalize_mac  # noqa: E402
 import fhfactory  # noqa: E402
+import chainroute  # noqa: E402
 from ui import UI_HTML  # noqa: E402
 
 STOCK2UBI_NAME = "an758x-stock2ubi"
@@ -72,6 +73,9 @@ UBOOT_RELEASES_API = "https://api.github.com/repos/pbs05/uboot-an758x/releases"
 # ---------------------------------------------------------------- utilities
 def log(*a):
     print(*a, file=sys.stderr, flush=True)
+
+
+chainroute.LOGF = lambda msg: log("[chain] %s" % msg)
 
 
 def local_ip_for(target_ip: str) -> str:
@@ -991,17 +995,204 @@ class FlashSession(threading.Thread):
 
 
 # ---------------------------------------------------------------- web app
+CHAIN_STEP_DEFS = [
+    ("prepare",      "校验固件并自动判定 UBI 布局",  False),
+    ("wait_recovery", "等待恢复页就绪（长按 reset）",  False),
+    ("upload",       "上传固件到恢复页（⚠ 擦写闪存）", True),
+    ("progress",     "等待写入完成（勿断电）",        False),
+    ("reboot",       "重启进入新系统",               False),
+]
+
+
+class ChainSession(threading.Thread):
+    """XR1710G chainloader 路线会话：恢复页自动刷固件。"""
+
+    def __init__(self, cfg: dict):
+        super().__init__(daemon=True)
+        self.cfg = cfg
+        self.dev = get_device(cfg.get("device"))
+        self.lock = threading.Lock()
+        self.steps = [{"id": i, "name": n, "state": "pending", "detail": ""}
+                      for i, n, _ in CHAIN_STEP_DEFS]
+        self.logs = []
+        self.error = None
+        self.finished = False
+        self.abort = threading.Event()
+        self.confirm_gate = threading.Event()
+        self.pending_confirm = None
+        self.layout = cfg.get("layout") or None
+
+    # ---- 与 FlashSession 相同的状态接口 ----
+    def state(self) -> dict:
+        with self.lock:
+            return {"mode": "chain", "device": self.dev.key,
+                    "steps": [{"id": s["id"], "name": s["name"],
+                               "state": s["state"], "detail": s["detail"]}
+                              for s in self.steps],
+                    "logs": self.logs[-500:], "error": self.error,
+                    "finished": self.finished, "pending_confirm": self.pending_confirm,
+                    "backup_dir": None}
+
+    def log(self, msg):
+        stamp = time.strftime("%H:%M:%S")
+        with self.lock:
+            self.logs.append("[%s] %s" % (stamp, msg))
+
+    def _step(self, sid, state=None, detail=None):
+        with self.lock:
+            for s in self.steps:
+                if s["id"] == sid:
+                    if state:
+                        s["state"] = state
+                    if detail is not None:
+                        s["detail"] = detail
+
+    def confirm(self, ok: bool):
+        if self.pending_confirm:
+            self.log("用户%s了危险操作确认" % ("通过" if ok else "拒绝"))
+            if not ok:
+                self.abort.set()
+            self.confirm_gate.set()
+
+    def _ask(self, sid, message):
+        with self.lock:
+            self.pending_confirm = {"step": sid, "message": message}
+        self.confirm_gate.clear()
+        self._step(sid, "confirm")
+        self.confirm_gate.wait()
+        with self.lock:
+            self.pending_confirm = None
+        if self.abort.is_set():
+            raise RuntimeError("用户取消")
+
+    def run(self):
+        try:
+            self._run()
+        except Exception as e:
+            with self.lock:
+                self.error = "%s: %s" % (type(e).__name__, e)
+                self.logs.append("[!!] %s" % self.error)
+            self.log("流程中止：%s" % e)
+        finally:
+            with self.lock:
+                self.finished = True
+
+    def _run(self):
+        cfg = self.cfg
+        fw = cfg.get("firmware") or ""
+        if not fw or not Path(fw).is_file():
+            raise RuntimeError("系统固件文件不存在：%r" % fw)
+        ip = cfg.get("ip") or chainroute.RECOVERY_IP
+        port = 80
+        if ":" in ip:
+            ip, _, ps = ip.rpartition(":")
+            if ps.isdigit():
+                port = int(ps)
+
+        # 1. 校验 + 布局判定
+        self._step("prepare", "running")
+        size = Path(fw).stat().st_size
+        if size < 1024 * 1024:
+            raise RuntimeError("固件 %s 只有 %d B，恢复页要求 ≥1 MiB（文件可能不完整）"
+                               % (Path(fw).name, size))
+        self.log("固件：%s（%.1f MB）" % (Path(fw).name, size / 1048576))
+        info = chainroute.fit_ubi_info(fw)
+        self.log("FIT 解析：%s" % info["desc"])
+        if self.layout:
+            self.log("使用手动指定的布局 %s（自动判定为 %s）"
+                     % (self.layout, info["layout"] or "未知"))
+        elif info["layout"]:
+            self.layout = info["layout"]
+            self.log("自动判定布局：%s" % self.layout)
+        else:
+            raise RuntimeError("无法自动判定 UBI 布局（%s）。请在页面上手动选择 2.0/1.5/1.0"
+                               "（对照固件内嵌设备树的 ubi 分区大小）" % info["desc"])
+        self._step("prepare", "done", "布局 %s" % self.layout)
+        if self.abort.is_set():
+            raise RuntimeError("用户中止")
+
+        # 2. 等恢复页
+        self._step("wait_recovery", "running")
+        cli = chainroute.XRRecoveryClient(ip=ip, port=port, logger=self.log)
+        self.log("请让设备进入恢复模式：10GbE 口 LED 开始闪烁后长按 reset，"
+                 "状态灯从常亮红变成跑马灯即松手；电脑网卡保持 DHCP。")
+        self.log("正在轮询 http://%s …（最多等 10 分钟）" % ip)
+        deadline = time.time() + 600
+        while time.time() < deadline:
+            if self.abort.is_set():
+                raise RuntimeError("用户中止")
+            try:
+                about = cli.about()
+                self.log("恢复页已就绪：%s / %s（检测布局 %s）"
+                         % (about.get("u_boot", "?"),
+                            about.get("recovery_version", "?"),
+                            about.get("detected_layout", "?")))
+                break
+            except Exception:
+                time.sleep(3)
+        else:
+            raise TimeoutError("10 分钟内未等到恢复页（%s）。检查：电脑是否 DHCP、"
+                               "是否插 10GbE 口、reset 按压时机。" % ip)
+        self._step("wait_recovery", "done")
+
+        # 3. 确认并上传
+        self._ask("upload",
+                  "即将把固件写入闪存（布局 %s）。\n"
+                  "· 恢复页会重建 ubootenv / fit / rootfs_data，出厂 EEPROM 与 MAC 从"
+                  "厂商 DSD 区自动恢复\n"
+                  "· 写入期间【绝对不能断电】\n确认继续？" % self.layout)
+        self._step("upload", "running")
+        data = Path(fw).read_bytes()
+        self.log("上传固件 %d B（布局 %s）…" % (len(data), self.layout))
+        cli.upload_firmware(data, self.layout)
+        self._step("upload", "done", "%.1f MB" % (len(data) / 1048576))
+
+        # 4. 等写入完成
+        self._step("progress", "running")
+        t0 = time.time()
+
+        def on_prog(done, total, phase):
+            if total:
+                self._step("progress", "running", "%d%%（%.0f MB/%.0f MB）"
+                           % (done * 100 // total, done / 1048576, total / 1048576))
+            else:
+                self._step("progress", "running", "phase=%s" % phase)
+
+        cli.wait_done(timeout=3600, interval=1.5, progress=on_prog)
+        self.log("写入完成，用时 %.0f 秒" % (time.time() - t0))
+        self._step("progress", "done")
+
+        # 5. 重启
+        self._step("reboot", "running")
+        try:
+            cli.reboot()
+        except Exception as e:
+            self.log("reboot 请求失败（%s）——设备可能已自行重启，忽略" % e)
+        self.log("设备正在重启。约 1–2 分钟后从 10GbE 口（DHCP）进新系统，"
+                 "默认地址见固件说明。")
+        self._step("reboot", "done")
+
+
 class WebApp:
     def __init__(self, port=8799):
         self.port = port
         self.session = None
+        self.chain = None
+        self.chain_tftp = None       # MiniTFTPServer 实例
+        self.chain_dl = None         # {"busy","what","logs","result","error"}
         self.session_lock = threading.Lock()
 
     def start_session(self, cfg: dict):
         with self.session_lock:
-            if self.session and not self.session.finished:
+            if (self.session and not self.session.finished) or \
+                    (self.chain and not self.chain.finished):
                 raise RuntimeError("已有会话在进行中，请先等待完成或中止")
             cfg = dict(cfg)
+            dev = get_device(cfg.get("device"))
+            if dev.route == "chainloader":
+                self.chain = ChainSession(cfg)
+                self.chain.start()
+                return True
             cfg["_payload_url"] = "http://%s:%d/payload/%s" % (
                 local_ip_for(cfg.get("ip") or "192.168.1.1"), self.port, STOCK2UBI_NAME)
             self.session = FlashSession(cfg)
@@ -1038,7 +1229,12 @@ class WebApp:
                     payload["bundled_count"] = len(idx.get("files") or {})
                     self._send(200, json.dumps(payload, ensure_ascii=False))
                 elif path == "/api/state":
-                    if app.session:
+                    active = app.chain if (app.chain and not app.chain.finished) else app.session
+                    if active:
+                        self._send(200, json.dumps(active.state(), ensure_ascii=False))
+                    elif app.chain:
+                        self._send(200, json.dumps(app.chain.state(), ensure_ascii=False))
+                    elif app.session:
                         self._send(200, json.dumps(app.session.state(), ensure_ascii=False))
                     else:
                         self._send(200, json.dumps({"steps": [], "logs": [], "finished": True,
@@ -1085,19 +1281,19 @@ class WebApp:
                     except Exception as e:
                         self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
                 elif path == "/api/confirm":
-                    if app.session:
+                    active = app.chain or app.session
+                    if active:
                         req = json.loads(body.decode("utf-8") or "{}")
-                        app.session.confirm(bool(req.get("ok", True)))
+                        active.confirm(bool(req.get("ok", True)))
                         self._send(200, '{"ok":true}')
                     else:
                         self._send(400, '{"error":"no session"}')
                 elif path == "/api/abort":
-                    if app.session:
-                        app.session.abort.set()
-                        app.session.confirm(False)
-                        self._send(200, '{"ok":true}')
-                    else:
-                        self._send(200, '{"ok":true}')
+                    for active in (app.chain, app.session):
+                        if active:
+                            active.abort.set()
+                            active.confirm(False)
+                    self._send(200, '{"ok":true}')
                 elif path == "/api/probe_mac":
                     try:
                         req = json.loads(body.decode("utf-8"))
@@ -1128,6 +1324,92 @@ class WebApp:
                         self._send(200, json.dumps(out, ensure_ascii=False))
                     except Exception as e:
                         self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
+                elif path == "/api/chain/download":
+                    # 后台线程下载 chainloader / 固件，状态经 /api/chain/dl 查询
+                    try:
+                        req = json.loads(body.decode("utf-8"))
+                        what = req.get("what")
+                        if what not in ("chainloader", "firmware"):
+                            raise ValueError("what 必须是 chainloader 或 firmware")
+                        if app.chain_dl and app.chain_dl.get("busy"):
+                            raise RuntimeError("已有下载任务在跑")
+                        dest = req.get("dir") or str(FIRMWARE_DIR)
+                        if what == "chainloader":
+                            # exe 内置优先（bundled_fw/ 里的 *-flash-slot.bin）
+                            for p in sorted(bundled_fw_dir().glob("*flash-slot*.bin")):
+                                target = Path(dest) / p.name
+                                if not target.exists() or \
+                                        target.stat().st_size != p.stat().st_size:
+                                    target.parent.mkdir(parents=True, exist_ok=True)
+                                    shutil.copyfile(p, target)
+                                log("使用内置 chainloader：%s" % p.name)
+                                self._send(200, json.dumps(
+                                    {"ok": True, "result": {"tag": "内置",
+                                                            "path": str(target),
+                                                            "size": target.stat().st_size}},
+                                    ensure_ascii=False))
+                                return
+
+                        def worker(what=what, dest=dest):
+                            st = {"busy": True, "what": what, "logs": [],
+                                  "result": None, "error": None}
+                            app.chain_dl = st
+                            try:
+                                r = (chainroute.firmware_fetch(dest) if what == "firmware"
+                                     else chainroute.chainloader_fetch(dest))
+                                st["result"] = r
+                                st["logs"].append("完成：%s（%d B）" % (r["path"], r["size"]))
+                            except Exception as e:
+                                st["error"] = str(e)
+                                st["logs"].append("失败：%s" % e)
+                            finally:
+                                st["busy"] = False
+
+                        threading.Thread(target=worker, daemon=True).start()
+                        self._send(200, '{"ok":true}')
+                    except Exception as e:
+                        self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
+                elif path == "/api/chain/dl":
+                    st = app.chain_dl or {"busy": False, "logs": []}
+                    self._send(200, json.dumps(st, ensure_ascii=False))
+                elif path == "/api/chain/analyze":
+                    try:
+                        req = json.loads(body.decode("utf-8"))
+                        f = req.get("file") or ""
+                        if not f or not Path(f).is_file():
+                            raise ValueError("文件不存在：%s" % f)
+                        info = chainroute.fit_ubi_info(f)
+                        self._send(200, json.dumps(info, ensure_ascii=False))
+                    except Exception as e:
+                        self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
+                elif path == "/api/chain/ttl":
+                    # 生成 TTL 命令并启动 TFTP 服务
+                    try:
+                        req = json.loads(body.decode("utf-8") or "{}")
+                        f = req.get("file") or ""
+                        if not f or not Path(f).is_file():
+                            raise ValueError("chainloader 文件不存在：%s" % f)
+                        if app.chain_tftp:
+                            app.chain_tftp.shutdown()
+                            app.chain_tftp = None
+                        srv = chainroute.MiniTFTPServer(f, 69, logger=log)
+                        srv.start()
+                        app.chain_tftp = srv
+                        pc_ip = req.get("pc_ip") or local_ip_for("192.168.1.1")
+                        script = chainroute.ttl_script(pc_ip, Path(f).name)
+                        old_env = chainroute.ttl_script_old_env(pc_ip, Path(f).name)
+                        self._send(200, json.dumps({
+                            "pc_ip": pc_ip, "script": script,
+                            "script_old_env": old_env,
+                            "tftp": {"port": 69, "file": Path(f).name,
+                                     "size": Path(f).stat().st_size}}, ensure_ascii=False))
+                    except Exception as e:
+                        self._send(400, json.dumps({"error": str(e)}, ensure_ascii=False))
+                elif path == "/api/chain/tftp_stop":
+                    if app.chain_tftp:
+                        app.chain_tftp.shutdown()
+                        app.chain_tftp = None
+                    self._send(200, '{"ok":true}')
                 elif path == "/api/upload_tool":
                     ct = self.headers.get("Content-Type", "")
                     data = body
@@ -1151,6 +1433,14 @@ class WebApp:
                 if req.get("device") not in BY_KEY:
                     raise ValueError("未知机型")
                 dev = get_device(req["device"])
+                if dev.route == "chainloader":
+                    # chainloader 路线：只支持一键刷机，字段为 firmware/layout/ip
+                    if mode != "full":
+                        raise ValueError("该机型（chainloader 路线）仅支持一键刷机模式")
+                    if not req.get("firmware") or not Path(req["firmware"]).is_file():
+                        raise ValueError("缺少系统固件（*-sysupgrade.itb）：%s"
+                                         % req.get("firmware"))
+                    return
                 if mode in ("full",):
                     for k, label in (("bl2", "BL2/firstblock"), ("fip", "U-Boot FIP"),
                                      ("sys", "系统固件")):
